@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import string
+import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -29,35 +30,70 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
 
 DEBUG_MODE = _env_flag("DEBUG")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG" if DEBUG_MODE else "INFO").upper()
+GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+
+class CloudRunJsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        structured_payload = getattr(record, "structured_payload", None)
+        if isinstance(structured_payload, dict):
+            payload = structured_payload.copy()
+            payload.setdefault("message", payload.get("event", record.getMessage()))
+        else:
+            payload = {"message": record.getMessage()}
+
+        payload["severity"] = record.levelname
+        payload["logger"] = record.name
+
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(payload, separators=(",", ":"), default=str)
+
+
+def _configure_logging() -> None:
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(CloudRunJsonFormatter())
+    root_logger.addHandler(handler)
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 
-def _format_log_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return str(value).lower()
-    if isinstance(value, int | float):
-        return str(value)
+def _build_log_payload(event: str, **fields: Any) -> dict[str, Any]:
+    payload = {
+        "event": event,
+        **{key: value for key, value in fields.items() if value is not None},
+    }
 
-    text = str(value)
-    if not text or any(char.isspace() for char in text):
-        return json.dumps(text, separators=(",", ":"))
-    return text
+    cloud_trace_id = payload.get("cloud_trace_id")
+    if GOOGLE_CLOUD_PROJECT and isinstance(cloud_trace_id, str):
+        payload["logging.googleapis.com/trace"] = (
+            f"projects/{GOOGLE_CLOUD_PROJECT}/traces/{cloud_trace_id}"
+        )
+
+    return payload
 
 
 def _log_event(level: int, event: str, **fields: Any) -> None:
-    field_text = " ".join(
-        f"{key}={_format_log_value(value)}"
-        for key, value in fields.items()
-        if value is not None
+    logger.log(
+        level,
+        event,
+        extra={"structured_payload": _build_log_payload(event, **fields)},
     )
-    message = f"event={event} {field_text}" if field_text else f"event={event}"
-    logger.log(level, message)
+
+
+def _log_exception(event: str, **fields: Any) -> None:
+    logger.exception(
+        event,
+        extra={"structured_payload": _build_log_payload(event, **fields)},
+    )
 
 
 def _payload_for_log(payload: str) -> str:
@@ -531,11 +567,11 @@ class DetachedSSEManager:
                 error=str(exc),
                 duration_seconds=round(time.time() - job.created_at, 3),
             )
-            logger.exception(
-                "event=stream.job.background_exception request_id=%s job_id=%s cloud_trace_id=%s",
-                job.request_id,
-                job.job_id,
-                job.cloud_trace_id,
+            _log_exception(
+                "stream.job.background_exception",
+                request_id=job.request_id,
+                job_id=job.job_id,
+                cloud_trace_id=job.cloud_trace_id,
             )
             await self.mark_error(job_id, str(exc))
         else:
