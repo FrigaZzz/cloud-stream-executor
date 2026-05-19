@@ -830,10 +830,10 @@ async def random_character_event_producer(
 
     while produced < request.repeat:
         elapsed = time.monotonic() - started_at
-        remaining = request.total_duration_seconds - elapsed
+        #remaining = request.total_duration_seconds - elapsed
 
-        if remaining <= 0:
-            break
+        #if remaining <= 0:
+        #    break
 
         produced += 1
         await manager.append(
@@ -855,7 +855,7 @@ async def random_character_event_producer(
             request.min_delay_seconds,
             request.max_delay_seconds,
         )
-        sleep_for = min(delay, max(0.0, remaining))
+        sleep_for = min(delay, max(0.0,))# remaining))
 
         if sleep_for > 0:
             await asyncio.sleep(sleep_for)
