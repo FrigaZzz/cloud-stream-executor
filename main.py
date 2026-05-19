@@ -10,7 +10,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Coroutine
+from typing import Any, AsyncGenerator, Callable, Coroutine
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -141,11 +141,19 @@ def make_sse_data(payload: dict[str, Any]) -> str:
 
 
 @dataclass(slots=True)
-class BufferedSSEEvent:
+class LiveSSEEvent:
     seq: int
     payload: str
     terminal: bool = False
     created_at: float = field(default_factory=time.time)
+
+
+@dataclass(slots=True)
+class LiveSSESubscriber:
+    subscriber_id: str
+    queue: asyncio.Queue[LiveSSEEvent | None]
+    created_at: float = field(default_factory=time.time)
+    dropped_events: int = 0
 
 
 @dataclass(slots=True)
@@ -155,7 +163,7 @@ class DetachedSSEJob:
     cloud_trace_id: str | None = None
     created_at: float = field(default_factory=time.time)
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
-    events: list[BufferedSSEEvent] = field(default_factory=list)
+    subscribers: dict[str, LiveSSESubscriber] = field(default_factory=dict)
     next_seq: int = 1
     task: asyncio.Task[None] | None = None
     done: bool = False
@@ -171,11 +179,11 @@ class DetachedSSEManager:
         *,
         keepalive_seconds: float = 10.0,
         retention_seconds: int = 300,
-        max_buffered_events: int = 100,
+        subscriber_queue_size: int = 1,
     ) -> None:
         self.keepalive_seconds = keepalive_seconds
         self.retention_seconds = retention_seconds
-        self.max_buffered_events = max_buffered_events
+        self.subscriber_queue_size = max(1, subscriber_queue_size)
         self._jobs: dict[str, DetachedSSEJob] = {}
         self._jobs_lock = asyncio.Lock()
 
@@ -224,10 +232,15 @@ class DetachedSSEManager:
         if job.task is not None:
             raise RuntimeError(f"Job {job_id} already started")
 
-        job.task = asyncio.create_task(
-            self._run_job(job_id, producer_coro),
-            name=f"detached-sse-{job_id}",
-        )
+        async with job.condition:
+            if job.task is not None:
+                raise RuntimeError(f"Job {job_id} already started")
+
+            job.task = asyncio.create_task(
+                self._run_job(job_id, producer_coro),
+                name=f"detached-sse-{job_id}",
+            )
+
         _log_event(
             logging.INFO,
             "stream.job.scheduled",
@@ -253,19 +266,34 @@ class DetachedSSEManager:
 
             normalized_payload = _normalize_sse_payload(payload, seq)
             event_type = _extract_sse_event_type(normalized_payload)
+            subscribers = list(job.subscribers.values())
 
-            if not job.stream_closed:
-                job.events.append(
-                    BufferedSSEEvent(
-                        seq=seq,
-                        payload=normalized_payload,
-                        terminal=terminal,
-                    )
+            if subscribers:
+                event = LiveSSEEvent(
+                    seq=seq,
+                    payload=normalized_payload,
+                    terminal=terminal,
                 )
-                self._trim_live_buffer_locked(job)
+                delivered_subscribers = 0
+                dropped_subscribers = 0
+
+                for subscriber in subscribers:
+                    if terminal:
+                        dropped_subscribers += self._force_publish_locked(
+                            subscriber,
+                            event,
+                        )
+                        delivered_subscribers += 1
+                        continue
+
+                    if self._try_publish_locked(subscriber, event):
+                        delivered_subscribers += 1
+                    else:
+                        dropped_subscribers += 1
+
                 _log_event(
-                    logging.INFO,
-                    "sse.packet.buffered",
+                    logging.WARNING if dropped_subscribers else logging.INFO,
+                    "sse.packet.published",
                     request_id=job.request_id,
                     job_id=job.job_id,
                     cloud_trace_id=job.cloud_trace_id,
@@ -273,13 +301,15 @@ class DetachedSSEManager:
                     event_type=event_type,
                     terminal=terminal,
                     bytes=len(normalized_payload.encode("utf-8")),
-                    buffered_events=len(job.events),
+                    subscribers=len(subscribers),
+                    delivered_subscribers=delivered_subscribers,
+                    dropped_subscribers=dropped_subscribers,
                     payload=_payload_for_log(normalized_payload),
                 )
             else:
                 _log_event(
                     logging.WARNING,
-                    "sse.packet.dropped_stream_closed",
+                    "sse.packet.dropped_no_subscribers",
                     request_id=job.request_id,
                     job_id=job.job_id,
                     cloud_trace_id=job.cloud_trace_id,
@@ -297,14 +327,144 @@ class DetachedSSEManager:
             job.condition.notify_all()
             return seq
 
+    async def start_job_on_stream_open(
+        self,
+        job_id: str,
+        producer_factory: Callable[[], Coroutine[Any, Any, None]],
+    ) -> None:
+        job = await self.get_job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+
+        async with job.condition:
+            if job.task is not None:
+                return
+
+            job.task = asyncio.create_task(
+                self._run_job(job_id, producer_factory()),
+                name=f"detached-sse-{job_id}",
+            )
+
+        _log_event(
+            logging.INFO,
+            "stream.job.scheduled",
+            request_id=job.request_id,
+            job_id=job.job_id,
+            cloud_trace_id=job.cloud_trace_id,
+        )
+
+    def _publish_error_locked(
+        self,
+        job: DetachedSSEJob,
+        message: str,
+    ) -> None:
+        seq = job.next_seq
+        job.next_seq += 1
+        error_payload = make_sse_data(
+            {
+                "type": "error",
+                "job_id": job.job_id,
+                "error": message,
+            }
+        )
+        normalized_payload = _normalize_sse_payload(error_payload, seq)
+        subscribers = list(job.subscribers.values())
+
+        if subscribers:
+            event = LiveSSEEvent(
+                seq=seq,
+                payload=normalized_payload,
+                terminal=True,
+            )
+            dropped_subscribers = 0
+            for subscriber in subscribers:
+                dropped_subscribers += self._force_publish_locked(subscriber, event)
+
+            _log_event(
+                logging.ERROR,
+                "sse.packet.published",
+                request_id=job.request_id,
+                job_id=job.job_id,
+                cloud_trace_id=job.cloud_trace_id,
+                seq=seq,
+                event_type="error",
+                terminal=True,
+                bytes=len(normalized_payload.encode("utf-8")),
+                subscribers=len(subscribers),
+                delivered_subscribers=len(subscribers),
+                dropped_subscribers=dropped_subscribers,
+                payload=_payload_for_log(normalized_payload),
+            )
+        else:
+            _log_event(
+                logging.ERROR,
+                "sse.packet.dropped_no_subscribers",
+                request_id=job.request_id,
+                job_id=job.job_id,
+                cloud_trace_id=job.cloud_trace_id,
+                seq=seq,
+                event_type="error",
+                terminal=True,
+                bytes=len(normalized_payload.encode("utf-8")),
+                payload=_payload_for_log(normalized_payload),
+            )
+
+    def _try_publish_locked(
+        self,
+        subscriber: LiveSSESubscriber,
+        event: LiveSSEEvent | None,
+    ) -> bool:
+        try:
+            subscriber.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            subscriber.dropped_events += 1
+            return False
+
+        return True
+
+    def _force_publish_locked(
+        self,
+        subscriber: LiveSSESubscriber,
+        event: LiveSSEEvent | None,
+    ) -> int:
+        dropped_events = 0
+
+        while True:
+            try:
+                subscriber.queue.put_nowait(event)
+                return dropped_events
+            except asyncio.QueueFull:
+                try:
+                    subscriber.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    continue
+
+                subscriber.dropped_events += 1
+                dropped_events += 1
+
+    def _clear_subscriber_queue_locked(self, subscriber: LiveSSESubscriber) -> int:
+        cleared_events = 0
+
+        while True:
+            try:
+                subscriber.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return cleared_events
+
+            cleared_events += 1
+
     async def mark_done(self, job_id: str) -> None:
         job = await self.get_job(job_id)
         if job is None:
             return
 
         async with job.condition:
+            already_done = job.done
             job.done = True
             job.finished_at = job.finished_at or time.time()
+            if not already_done:
+                for subscriber in list(job.subscribers.values()):
+                    self._force_publish_locked(subscriber, None)
             job.condition.notify_all()
 
     async def mark_error(self, job_id: str, message: str) -> None:
@@ -316,53 +476,7 @@ class DetachedSSEManager:
             job.error = message
             job.done = True
             job.finished_at = time.time()
-
-            seq = job.next_seq
-            job.next_seq += 1
-            error_payload = make_sse_data(
-                {
-                    "type": "error",
-                    "job_id": job_id,
-                    "error": message,
-                }
-            )
-            normalized_payload = _normalize_sse_payload(error_payload, seq)
-
-            if not job.stream_closed:
-                job.events.append(
-                    BufferedSSEEvent(
-                        seq=seq,
-                        payload=normalized_payload,
-                        terminal=True,
-                    )
-                )
-                _log_event(
-                    logging.ERROR,
-                    "sse.packet.buffered",
-                    request_id=job.request_id,
-                    job_id=job.job_id,
-                    cloud_trace_id=job.cloud_trace_id,
-                    seq=seq,
-                    event_type="error",
-                    terminal=True,
-                    bytes=len(normalized_payload.encode("utf-8")),
-                    buffered_events=len(job.events),
-                    payload=_payload_for_log(normalized_payload),
-                )
-            else:
-                _log_event(
-                    logging.ERROR,
-                    "sse.packet.dropped_stream_closed",
-                    request_id=job.request_id,
-                    job_id=job.job_id,
-                    cloud_trace_id=job.cloud_trace_id,
-                    seq=seq,
-                    event_type="error",
-                    terminal=True,
-                    bytes=len(normalized_payload.encode("utf-8")),
-                    payload=_payload_for_log(normalized_payload),
-                )
-
+            self._publish_error_locked(job, message)
             job.condition.notify_all()
 
     async def cancel_job(self, job_id: str, *, reason: str = "cancelled") -> bool:
@@ -386,14 +500,33 @@ class DetachedSSEManager:
         async with job.condition:
             job.done = True
             job.finished_at = time.time()
+            for subscriber in list(job.subscribers.values()):
+                self._force_publish_locked(subscriber, None)
             job.condition.notify_all()
 
         return True
 
-    async def stream(self, *, job_id: str) -> AsyncGenerator[str, None]:
+    async def stream(
+        self,
+        *,
+        job_id: str,
+        producer_factory: Callable[[], Coroutine[Any, Any, None]] | None = None,
+    ) -> AsyncGenerator[str, None]:
         job = await self.get_job(job_id)
         if job is None:
             raise KeyError(job_id)
+
+        subscriber = LiveSSESubscriber(
+            subscriber_id=str(uuid4()),
+            queue=asyncio.Queue(maxsize=self.subscriber_queue_size),
+        )
+
+        async with job.condition:
+            if job.done:
+                return
+
+            job.subscribers[subscriber.subscriber_id] = subscriber
+            job.stream_closed = False
 
         _log_event(
             logging.INFO,
@@ -401,48 +534,25 @@ class DetachedSSEManager:
             request_id=job.request_id,
             job_id=job.job_id,
             cloud_trace_id=job.cloud_trace_id,
+            subscriber_id=subscriber.subscriber_id,
+            active_subscribers=len(job.subscribers),
         )
+
+        if producer_factory is not None:
+            await self.start_job_on_stream_open(job_id, producer_factory)
 
         try:
             while True:
-                keepalive = False
+                try:
+                    event = await asyncio.wait_for(
+                        subscriber.queue.get(),
+                        timeout=self.keepalive_seconds,
+                    )
+                except TimeoutError:
+                    async with job.condition:
+                        if job.done and subscriber.queue.empty():
+                            return
 
-                async with job.condition:
-                    while not job.events and not job.done:
-                        try:
-                            await asyncio.wait_for(
-                                job.condition.wait(),
-                                timeout=self.keepalive_seconds,
-                            )
-                        except TimeoutError:
-                            keepalive = True
-                            break
-
-                    pending = list(job.events)
-                    job.events.clear()
-                    is_done = job.done and not pending
-
-                if pending:
-                    for event in pending:
-                        _log_event(
-                            logging.INFO,
-                            "sse.packet.sent",
-                            request_id=job.request_id,
-                            job_id=job.job_id,
-                            cloud_trace_id=job.cloud_trace_id,
-                            seq=event.seq,
-                            event_type=_extract_sse_event_type(event.payload),
-                            terminal=event.terminal,
-                            bytes=len(event.payload.encode("utf-8")),
-                            payload=_payload_for_log(event.payload),
-                        )
-                        yield event.payload
-                    continue
-
-                if is_done:
-                    return
-
-                if keepalive:
                     keepalive_payload = ": keep-alive\n\n"
                     _log_event(
                         logging.INFO,
@@ -456,18 +566,56 @@ class DetachedSSEManager:
                         payload=_payload_for_log(keepalive_payload),
                     )
                     yield keepalive_payload
-        finally:
-            await self.close_stream(job_id, reason="response_generator_closed")
+                    continue
 
-    async def close_stream(self, job_id: str, *, reason: str = "stream_closed") -> None:
+                if event is None:
+                    return
+
+                _log_event(
+                    logging.INFO,
+                    "sse.packet.sent",
+                    request_id=job.request_id,
+                    job_id=job.job_id,
+                    cloud_trace_id=job.cloud_trace_id,
+                    subscriber_id=subscriber.subscriber_id,
+                    seq=event.seq,
+                    event_type=_extract_sse_event_type(event.payload),
+                    terminal=event.terminal,
+                    bytes=len(event.payload.encode("utf-8")),
+                    payload=_payload_for_log(event.payload),
+                )
+                yield event.payload
+
+                if event.terminal:
+                    return
+        finally:
+            await self.close_stream(
+                job_id,
+                subscriber_id=subscriber.subscriber_id,
+                reason="response_generator_closed",
+            )
+
+    async def close_stream(
+        self,
+        job_id: str,
+        *,
+        subscriber_id: str,
+        reason: str = "stream_closed",
+    ) -> None:
         job = await self.get_job(job_id)
         if job is None:
             return
 
         async with job.condition:
-            already_closed = job.stream_closed
-            job.events.clear()
-            job.stream_closed = True
+            subscriber = job.subscribers.pop(subscriber_id, None)
+            cleared_events = (
+                self._clear_subscriber_queue_locked(subscriber)
+                if subscriber is not None
+                else 0
+            )
+            already_closed = subscriber is None
+            job.stream_closed = not job.subscribers
+            active_subscribers = len(job.subscribers)
             job.condition.notify_all()
 
         closed_before_done = not job.done
@@ -483,6 +631,12 @@ class DetachedSSEManager:
             cloud_trace_id=job.cloud_trace_id,
             reason=reason,
             already_closed=already_closed,
+            subscriber_id=subscriber_id,
+            active_subscribers=active_subscribers,
+            cleared_events=cleared_events,
+            subscriber_dropped_events=(
+                subscriber.dropped_events if subscriber is not None else None
+            ),
             job_done=job.done,
             job_cancelled=job.cancelled,
             job_error=job.error,
@@ -609,16 +763,6 @@ class DetachedSSEManager:
 
         for job_id in expired_job_ids:
             self._jobs.pop(job_id, None)
-
-    def _trim_live_buffer_locked(self, job: DetachedSSEJob) -> None:
-        if self.max_buffered_events <= 0:
-            job.events.clear()
-            return
-
-        overflow = len(job.events) - self.max_buffered_events
-        if overflow > 0:
-            del job.events[:overflow]
-
 
 manager = DetachedSSEManager()
 
@@ -789,16 +933,14 @@ async def stream_random_character_events(
         min_delay_seconds=stream_request.min_delay_seconds,
         max_delay_seconds=stream_request.max_delay_seconds,
     )
-    await manager.start_job(
-        job.job_id,
-        random_character_event_producer(
-            job_id=job.job_id,
-            request=stream_request,
-        ),
-    )
-
     async def response_generator() -> AsyncGenerator[str, None]:
-        async for payload in manager.stream(job_id=job.job_id):
+        async for payload in manager.stream(
+            job_id=job.job_id,
+            producer_factory=lambda: random_character_event_producer(
+                job_id=job.job_id,
+                request=stream_request,
+            ),
+        ):
             yield payload
 
     return StreamingResponse(
